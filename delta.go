@@ -38,19 +38,25 @@ type ChunkDelta struct {
 // The order presumes all removals first, DESC (from end to start), then all additions ASC (from start to end),
 func GetChunksDeltas(original, updated []*Chunk) ([]*ChunkDelta, error) {
 
+	type deltaIndex struct {
+		delta *ChunkDelta
+		index int
+	}
+
 	var (
 		// Cursors for the original slice and updated slice
 		oc, uc int
 
 		// Temp deltas
-		removals  []*ChunkDelta
-		additions []*ChunkDelta
+		removals       []*ChunkDelta
+		removalsIndex  = make(map[string]*deltaIndex) // to speedup lookups
+		additions      []*ChunkDelta
+		additionsIndex = make(map[string]*deltaIndex) // to speedup lookups
 
 		// Final deltas
 		deltas []*ChunkDelta
 	)
 
-mainLoop:
 	// Loop until both slices are exhausted
 	for oc < len(original) || uc < len(updated) {
 
@@ -67,45 +73,59 @@ mainLoop:
 		// Chunks' hashes are the same
 		if o != nil && u != nil && o.Hash == u.Hash {
 			// We got to a converging point, all temp changes so far need to be persisted
-			deltas = append(deltas, removals...)  // persist removals
-			removals = removals[:0]               // clear temp removals
+			deltas = append(deltas, removals...) // persist removals
+			removals = removals[:0]              // clear temp removals
+			removalsIndex = make(map[string]*deltaIndex)
+
 			deltas = append(deltas, additions...) // persist additions
 			additions = additions[:0]             // clear temp additions
+			additionsIndex = make(map[string]*deltaIndex)
+
 			goto moveCursors
 		}
 
 		// Chunks' hashes differ.
 		// Lookup new chunk in the list of temporarily removed chunks, maybe it was shifted forward
 		if u != nil {
-			for remPos, remChunk := range removals {
-				if remChunk.Hash == u.Hash {
-					// New chunk was simply shifted forward by a chunk addition, found it in the list of temp removals.
-					deltas = append(deltas, removals[:remPos]...) // persist temp removals until this point
-					removals = removals[:0]                       // clear temp removals cache
-					oc = remChunk.Position                        // Reset original slice cursor to the found one
-					continue mainLoop
-				}
+			rem, ok := removalsIndex[u.Hash]
+			if ok {
+				// New chunk was simply shifted forward by a chunk addition, found it in the list of temp removals.
+				deltas = append(deltas, removals[:rem.index]...) // persist temp removals until this point
+				removals = removals[:0]                          // clear temp removals cache
+				removalsIndex = make(map[string]*deltaIndex)
+				oc = rem.delta.Position // Reset original slice cursor to the found one
+				continue
 			}
 		}
 		// Lookup original chunk in the list of temporarily added chunks, maybe it was shifted backwards
 		if o != nil {
-			for addPos, addChunk := range additions {
-				if addChunk.Hash == o.Hash {
-					// Original chunk was simply shifted backward by a chunk removal
-					deltas = append(deltas, additions[:addPos]...) // persist temp additions until this point
-					additions = additions[:0]                      // clear temp additions cache
-					uc = addChunk.Position                         // Reset updated slice cursor to the found one
-					continue mainLoop
-				}
+			add, ok := additionsIndex[o.Hash]
+			if ok {
+				// Original chunk was simply shifted backward by a chunk removal
+				deltas = append(deltas, additions[:add.index]...) // persist temp additions until this point
+				additions = additions[:0]                         // clear temp additions cache
+				additionsIndex = make(map[string]*deltaIndex)
+				uc = add.delta.Position
+				continue
 			}
 		}
 
 		// No reoccurrence found in the existing temp deltas, add these too.
 		if o != nil {
-			removals = append(removals, &ChunkDelta{o, DeltaTypeRemove, oc})
+			chunkDelta := &ChunkDelta{o, DeltaTypeRemove, oc}
+			removals = append(removals, chunkDelta)
+			// index only first occurrence
+			if _, ok := removalsIndex[o.Hash]; !ok {
+				removalsIndex[o.Hash] = &deltaIndex{delta: chunkDelta, index: len(removals) - 1}
+			}
 		}
 		if u != nil {
-			additions = append(additions, &ChunkDelta{u, DeltaTypeAdd, uc})
+			chunkDelta := &ChunkDelta{u, DeltaTypeAdd, uc}
+			additions = append(additions, chunkDelta)
+			// index only first occurrence
+			if _, ok := additionsIndex[u.Hash]; !ok {
+				additionsIndex[u.Hash] = &deltaIndex{delta: chunkDelta, index: len(additions) - 1}
+			}
 		}
 
 	moveCursors:
